@@ -1,195 +1,438 @@
-//Initialize our ml5 and dictionary to store image IDs from google
-let classifier = ml5.imageClassifier("https://teachablemachine.withgoogle.com/models/Z7sdOoyx6/"); //Access our ml5.js for image classification
+import * as tf from "@tensorflow/tfjs";
 
-//Every img has a corresponding ID on google. We use that ID as key and the value is its parent div
-//to indicate that the image is scanned.
-let imageClassified = {}; //Use to keep track of images on google and avoid duplicates when performing ML
+/* =========================================================
+   IMAGE CLASSIFICATION MODEL
+========================================================= */
 
-let AIData = {"NotAI": 0, "AINeutral": 0, "AIGenerated": 0, "TotalScan": 0};
+const IMAGE_MODEL_BASE_URL =
+  "https://teachablemachine.withgoogle.com/models/ZIGMmrziY/";
 
-//Start observing the image section on google
-window.onload = () => {
-  // Select the node that will be observed for mutations
-  const targetNode = document.getElementById("gsr"); // whole HTML page on the image section on google
-  selfObserver(targetNode);
-};
+const IMAGE_MODEL_URL = `${IMAGE_MODEL_BASE_URL}model.json`;
+const IMAGE_METADATA_URL = `${IMAGE_MODEL_BASE_URL}metadata.json`;
 
-/*
-  This function is responsible for observing the web page.
-  If any changes occur on the webpage, call the main function to perform its tasks.
-*/
-function selfObserver(documentNode) {
-  // Create an observer instance for main
-  const observer = new MutationObserver(function () {
-    main();
-  });
+let imageModelPromise = loadImageModel();
 
-  // Options for the observer (which mutations to observe)
-  const config = {
-    attributes: true,
+async function loadImageModel() {
+  await tf.ready();
+  try {
+    await tf.setBackend("webgl");
+  } catch { }
+
+  const [model, metadata] = await Promise.all([
+    tf.loadLayersModel(IMAGE_MODEL_URL),
+    fetch(IMAGE_METADATA_URL).then((r) => r.json()),
+  ]);
+
+  return { model, metadata };
+}
+
+/* =========================================================
+   GLOBAL STATE
+========================================================= */
+
+let wikipediaDataset = null;
+let imageClassified = {};
+
+let lastUrl = location.href;
+let lastTextScanSignature = "";
+let textScanInFlight = false;
+
+/* =========================================================
+   INIT
+========================================================= */
+
+window.onload = async () => {
+  // Replace the dataset path below to use your own JSONL file
+  wikipediaDataset = await loadDatasetJSONL("data/wikipedia.jsonl");
+
+  observeUrlChange();
+
+  new MutationObserver(() => main()).observe(document.body, {
     childList: true,
     subtree: true,
-    attributeOldValue: true,
-    characterData: true,
-    characterDataOldValue: true,
-  };
+  });
 
-  // Start observing
-  try{
-    observer.observe(documentNode, config);
-  }catch(error){
-    console.log("Cannot Observe.");
+  main();
+};
+
+/* =========================================================
+   URL CHANGE DETECTION
+========================================================= */
+
+function observeUrlChange() {
+  setInterval(() => {
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      imageClassified = {};
+      lastTextScanSignature = "";
+      main();
+    }
+  }, 300);
+}
+
+/* =========================================================
+   DATASET LOADING (TEXT CLASSIFICATION)
+========================================================= */
+
+/**
+ * DEV NOTE:
+ * Replace the `path` below with your own JSONL dataset.
+ *
+ * Expected JSONL format (one object per line):
+ * { "human_text": "..."}
+ * OR
+ * { "ai_text": "..."}
+ *
+ * Labels:
+ * - 0 = Human
+ * - 1 = AI
+ */
+async function loadDatasetJSONL(path) {
+  try {
+    const url = chrome.runtime.getURL(path);
+    const text = await (await fetch(url)).text();
+
+    return text
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          const item = JSON.parse(line);
+
+          if (item.human_text)
+            return { text: normalizeWhitespace(item.human_text), label: 0 };
+
+          if (item.ai_text)
+            return { text: normalizeWhitespace(item.ai_text), label: 1 };
+        } catch { }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
   }
 }
 
-/*
-  This function is the main functionality that will perform image classification for 
-  all images on google.
-*/
+/* =========================================================
+   MAIN PIPELINE
+========================================================= */
+
 function main() {
-  // console.log("Initiate Machine Learning");
-  chrome.storage.local.get('switchStatus', function(data) {
-    if (data.switchStatus === true) {
-      runML(); //Start
-    }else{
-      //reset
-      AIData = {"NotAI": 0, "AINeutral": 0, "AIGenerated": 0, "TotalScan": 0};
-      chrome.storage.local.set({ AIDataCollected: AIData });
+  chrome.storage.local.get("switchStatus", (data) => {
+    if (data.switchStatus) {
+      runImageClassification();
+      runTextClassification();
     }
   });
-  imageObtain();
+}
 
-  /*
-    This function gets all the image on the current page and store them in a dictionary.
-    For each image, we scan to see if the Image is AI-Generated.
-  */
-  function runML() {
-    // Get all the div that has this specific class name.
-    // bFtXbb CUMKHb uhHOwf BYbUcd -dev mode
-    // H8Rx8c -normal mode
+/* =========================================================
+   IMAGE CLASSIFICATION
+========================================================= */
 
-    //WIP
-    // p7sI2 PUxBg -img preview (User click on image to see the img bigger)
-    // fR600b islir -img suggestion (under img preview)
+function runImageClassification() {
+  const imgs = document.querySelectorAll(
+    ".crayons-article__cover, .crayons-article__main-image"
+  );
 
-    // h11UTe add in detail button
-    let img = document.querySelectorAll(
-      ".bFtXbb.CUMKHb.uhHOwf.BYbUcd, .H8Rx8c"
-    ); //This is a specific class name google used that contains an image.
+  for (let i of imgs) {
+    const imgTag = i.querySelector("img");
+    if (!imgTag) continue;
 
-    // For each div (that contains an image), we store them in a dictionary to prevent dup scans
-    for (let i of img) {
-      //If the image that we have given base on observer is new, add it
-      if (!(i.getElementsByTagName("img")[0].id in imageClassified)) {
-        imageClassified[i.getElementsByTagName("img")[0].id] =
-          i.getElementsByTagName("img")[0].src; //Store it
-
-        iconAssigned(null, i); //Loading icon
-        imageClassificationScan(i); //Start the scan for that image to see if the image is Ai-Generated
-        // console.log(i.getElementsByTagName("img")[0]); //Img tag
-        // console.log(i.getElementsByTagName("img")[0].id); //Img id=???
-      }
+    if (!(imgTag.src in imageClassified)) {
+      imageClassified[imgTag.src] = true;
+      renderImageIcon(null, i);
+      imageClassificationScan(i);
     }
   }
+}
 
-  /*
-    This function performs image classification to determine if the image is AI-Generated.
-    This will ultimately change the status icon on the webpage to show the user if the image is AI-Generated.
-  */
-  function imageClassificationScan(imgObj) {
-    //This extracts the image link from the img tag into our img Object
-    const img = loadImage(imgObj.getElementsByTagName("img")[0].src);
+async function imageClassificationScan(imgObj) {
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  img.src = imgObj.querySelector("img").src;
 
-    //Gives us the result of our classification (WIP)
-    let result = classifier.classify(img);
-    result
-      .then((results) => {
-        iconAssigned(results, imgObj);
-      })
-      .catch((error) => {
-        console.log(error); // Handles any errors
-      });
+  await new Promise((r) => (img.onload = r));
+
+  try {
+    const { model, metadata } = await imageModelPromise;
+
+    const tensor = tf.browser
+      .fromPixels(img)
+      .resizeBilinear([224, 224])
+      .toFloat()
+      .div(255)
+      .expandDims();
+
+    const pred = model.predict(tensor);
+    const scores = await pred.data();
+
+    tf.dispose([tensor, pred]);
+
+    const results = metadata.labels.map((l, i) => ({
+      label: l,
+      confidence: scores[i],
+    }));
+
+    results.sort((a, b) => b.confidence - a.confidence);
+
+    renderImageIcon(results, imgObj);
+  } catch {
+    renderImageIcon(null, imgObj);
+  }
+}
+
+function renderImageIcon(results, imgObj) {
+  const existing = imgObj.querySelector("#FrancisTRStatusAI");
+  if (existing) existing.remove();
+
+  imgObj.style.position = "relative";
+
+  const icon = document.createElement("img");
+
+  icon.style.position = "absolute";
+  icon.style.bottom = "10px";
+  icon.style.right = "10px";
+  icon.style.width = "42px";
+  icon.style.height = "42px";
+
+  icon.src = !results
+    ? chrome.runtime.getURL("Images/loading.gif")
+    : results[0].label === "AI"
+      ? chrome.runtime.getURL("Images/AIGenerated.png")
+      : chrome.runtime.getURL("Images/AIFree.png");
+
+  imgObj.appendChild(icon);
+}
+
+/* =========================================================
+   TEXT CLASSIFICATION (FULLY TUNABLE)
+========================================================= */
+
+function runTextClassification() {
+  if (textScanInFlight) return;
+
+  const text = getCleanArticleText();
+  // adjust minimum text length threshold
+  if (!text || text.length < 600) return;
+
+  const sig = text.slice(0, 300);
+  if (sig === lastTextScanSignature) return;
+
+  textScanInFlight = true;
+
+  const result = detectGPTStyle(text);
+
+  chrome.storage.local.set({ articleAnalysis: result });
+
+  lastTextScanSignature = sig;
+  textScanInFlight = false;
+}
+
+/**
+ * MAIN TEXT DETECTION LOGIC
+ *
+ * Tune weights below to control sensitivity
+ */
+function detectGPTStyle(text) {
+  if (!wikipediaDataset || wikipediaDataset.length < 10) {
+    return baseUnknownResult();
   }
 
-  /*
-    This helper function loads the image by config the crossorgin and assigning it to the img tag.
-    This is needed to process all images on google. 
-  */
-  function loadImage(src) {
-    var img = new Image();
-    img.setAttribute("crossorigin", "anonymous");
-    img.src = src;
-    return img;
+  const datasetScore = compareDataset(text);       // AI %
+  const devHuman = computeDevHumanScore(text);     // Human %
+  const generalHuman = computeGeneralScore(text);  // Human %
+  const aiPenalty = detectAIPatterns(text);        // AI %
+
+  // Adjust weights here
+  let humanScore =
+    devHuman * 0.40 +
+    (100 - datasetScore) * 0.35 +
+    generalHuman * 0.25 -
+    aiPenalty * 0.25;
+
+  // Modify squash sensitivity
+  humanScore = squashScore(humanScore);
+
+  // Adjust classification thresholds
+  let label =
+    humanScore <= 33.33
+      ? "AI-generated"
+      : humanScore >= 66.66
+        ? "Human-written"
+        : "Mixed";
+
+  const finalScore = Number(humanScore.toFixed(2));
+  return {
+    label,
+    averageAIScore: finalScore,
+    humanPercent: finalScore,
+    aiPercent: Number((100 - humanScore).toFixed(2)),
+    mixedPercent:
+      finalScore > 33.33 && finalScore < 66.66 ? 100 : 0,
+  };
+}
+
+/* -------------------------
+   FEATURE ENGINEERING
+------------------------- */
+
+/**
+ * Increase weight if you want more "human writing signals"
+ */
+function computeDevHumanScore(text) {
+  const words = tokenizeWords(text);
+  const sentences = splitSentences(text);
+
+  const pronouns = words.filter((w) =>
+    ["i", "my", "we", "our", "me"].includes(w)
+  ).length;
+
+  const personal = pronouns / (words.length || 1);
+
+  const lengths = sentences.map((s) => tokenizeWords(s).length);
+  const variability = variance(lengths);
+
+  return clamp((personal * 4 + variability / 100) * 100);
+}
+
+/**
+ * Add/remove AI phrases here
+ */
+function detectAIPatterns(text) {
+  const patterns = [
+    "in conclusion",
+    "overall",
+    "additionally",
+    "furthermore",
+    "this article will",
+  ];
+
+  let count = 0;
+
+  for (let p of patterns) {
+    if (text.toLowerCase().includes(p)) count++;
   }
 
-  /*
-    This function assign icons to the image base on the confidence rate. (WIP)
-    NOTE: If the confidence rate is less than 60 percent whether it is AI or not, then it is AI Neutral
-  */
-  function iconAssigned(results, imgObj) {
-    // Create the img tag for our status icon
-    var statusImg = document.createElement("img");
-    statusImg.setAttribute("id", "FrancisTRStatusAI");
+  // Adjust penalty strength
+  return clamp(count * 10, 0, 40);
+}
 
-    // Get our data and assign the icon (WIP)
-    try {
-      let result = [results[0].label, results[0].confidence * 100]; //Clean up data.
-      // console.log(result);
-      AIData["TotalScan"] += 1;
+/**
+ * DATASET SIMILARITY
+ *
+ * DEV OPTIONS:
+ * - Increase sample size (currently 30)
+ * - Replace cosine similarity with embeddings later
+ */
+function compareDataset(text) {
+  const vec = textToVector(text);
 
-      if ((result[0] === "AI" || result[0] === "NotAI") && result[1] <= 60.0) {
-        statusImg.src = chrome.runtime.getURL("Images/AINeutral.png");
-        AIData["AINeutral"] += 1;
-      } else if (result[0] === "AI" && result[1] > 60.0) {
-        statusImg.src = chrome.runtime.getURL("Images/AIGenerated.png");
-        AIData["AIGenerated"] += 1;
-      } else if (result[0] === "NotAI" && result[1] > 60.0) {
-        statusImg.src = chrome.runtime.getURL("Images/AIFree.png");
-        AIData["NotAI"] += 1;
-      }
-      chrome.storage.local.set({ AIDataCollected: AIData }); //Save data to display in main.html
-    } catch (error) {
-      statusImg.src = chrome.runtime.getURL("Images/loading.gif"); // This is the case if results is null.
-    }
+  const human = getBalancedSamples(0).map((s) =>
+    cosineSimilarity(vec, textToVector(s.text))
+  );
 
-    imgObj.appendChild(statusImg);
-  }
+  const ai = getBalancedSamples(1).map((s) =>
+    cosineSimilarity(vec, textToVector(s.text))
+  );
 
-  /*
-    This function allows the user to get the image they click on. (WIP)
-  */
-  function imageObtain() {
-    let detailButton = document.getElementsByClassName("h11UTe");
-    // console.log(detailButton);
+  return (mean(ai) / (mean(ai) + mean(human) + 1e-6)) * 100;
+}
 
-    // If the button does not exist, add it.
-    if (
-      detailButton[0] !== undefined &&
-      detailButton[0].querySelector("a[id='FrancisTRCustomImageDetail']") ===
-        null
-    ) {
-      let imgLink = document
-        .getElementsByClassName("YsLeY")[0]
-        .querySelector("img[class='sFlh5c FyHeAf']");
-      detailButton[0].innerHTML += `
-    <a
-    data-ved="0CBgQ3YkBahcKEwjQ6L63--uKAxUAAAAAHQAAAAAQBA"
-    rel="noopener"
-    target="_blank"
-    href="${imgLink.src}"
-    jsaction="focus:trigger.HTIQtd;mousedown:trigger.HTIQtd;touchstart:trigger.HTIQtd;;"
-    class="umNKYc"
-    id="FrancisTRCustomImageDetail"
-  >
-    <div class="MjJqGe ibX8Cd PMUcxf re5Hve cd29Sd kM7Sgc">
-      <span class="iLgTbf PMUcxf cS4Vcb-pGL6qe-lfQAOe">Get Image</span>
-      <svg viewBox="0 0 24 24" focusable="false" height="18" width="18">
-        <path d="M0 0h24v24H0z" fill="none"></path>
-        <path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"></path>
-      </svg>
-    </div>
-  </a>
-    `;
-    }
-  }
+function getBalancedSamples(label) {
+  // Increase slice size for higher accuracy (slower)
+  return wikipediaDataset.filter((d) => d.label === label).slice(0, 30);
+}
+
+/**
+ * General lexical diversity
+ */
+function computeGeneralScore(text) {
+  const words = tokenizeWords(text);
+
+  return (new Set(words).size / words.length) * 100;
+}
+
+/**
+ * Controls how extreme scores behave
+ */
+function squashScore(x) {
+  return 100 / (1 + Math.exp(-(x - 50) / 12));
+}
+
+/* =========================================================
+   UTILITIES
+========================================================= */
+
+function tokenizeWords(t) {
+  return t.toLowerCase().match(/[a-z0-9']+/g) || [];
+}
+
+function splitSentences(t) {
+  return t.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [];
+}
+
+function textToVector(text) {
+  const words = tokenizeWords(text);
+  const freq = {};
+  words.forEach((w) => (freq[w] = (freq[w] || 0) + 1));
+  return freq;
+}
+
+function cosineSimilarity(a, b) {
+  let dot = 0,
+    magA = 0,
+    magB = 0;
+
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+
+  keys.forEach((k) => {
+    const x = a[k] || 0;
+    const y = b[k] || 0;
+    dot += x * y;
+    magA += x * x;
+    magB += y * y;
+  });
+
+  return dot / (Math.sqrt(magA) * Math.sqrt(magB) + 1e-9);
+}
+
+function mean(arr) {
+  return arr.reduce((a, b) => a + b, 0) / (arr.length || 1);
+}
+
+function variance(arr) {
+  const m = mean(arr);
+  return arr.reduce((a, x) => a + (x - m) ** 2, 0) / (arr.length || 1);
+}
+
+function clamp(x, min = 0, max = 100) {
+  return Math.max(min, Math.min(max, x));
+}
+
+function normalizeWhitespace(t) {
+  return (t || "").replace(/\s+/g, " ").trim();
+}
+
+/* =========================================================
+   FALLBACK
+========================================================= */
+
+function baseUnknownResult() {
+  return {
+    label: "Unknown",
+    humanPercent: 50,
+    aiPercent: 50,
+  };
+}
+
+/* =========================================================
+   TEXT EXTRACTION
+========================================================= */
+
+function getCleanArticleText() {
+  const root =
+    document.querySelector(".crayons-article__body") ||
+    document.querySelector("article");
+
+  return root ? normalizeWhitespace(root.innerText) : "";
 }
